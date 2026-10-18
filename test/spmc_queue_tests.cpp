@@ -172,4 +172,29 @@ namespace MultiQueues {
         t1.join();
         t2.join();
     }
+    TEST(SPMCRegionTest, AttachSharesTheQueue) {
+        constexpr std::size_t capacity = 1 << 12;
+        alignas(detail::cache_line) static std::byte region[SPMC<>::region_size(capacity)];
+
+        SPMC<> created{region, capacity, SPMC<>::Open::Create};
+        auto producer{created.get_producer()};
+        ASSERT_TRUE(write_int(producer, 1));   // before anyone attaches
+
+        SPMC<> attached{region, capacity, SPMC<>::Open::Attach};
+        auto consumer{attached.get_consumer()};   // sees only what's written from here on
+        ASSERT_TRUE(write_int(producer, 2));
+
+        int v = 0;
+        ASSERT_EQ(read_int(consumer, v), ReadStatus::Ok);
+        EXPECT_EQ(v, 2);
+        EXPECT_EQ(read_int(consumer, v), ReadStatus::Empty);
+    }
+
+    TEST(SPMCRegionTest, AttachRejectsCapacityMismatch) {
+        constexpr std::size_t capacity = 1 << 12;
+        alignas(detail::cache_line) static std::byte region[SPMC<>::region_size(capacity)];
+        SPMC<> created{region, capacity, SPMC<>::Open::Create};
+        EXPECT_THROW((SPMC<>{region, capacity / 2, SPMC<>::Open::Attach}), std::runtime_error);
+    }
+
 };

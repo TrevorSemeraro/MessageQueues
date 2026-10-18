@@ -3,10 +3,12 @@
 #include <cerrno>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <new>
 #include <span>
+#include <stdexcept>
 #include <cassert>
 
 namespace MultiQueues {
@@ -35,6 +37,8 @@ namespace MultiQueues {
             alignas(cache_line) std::atomic<uint64_t> read_counter{0};
             alignas(cache_line) std::atomic<uint64_t> write_counter{0};
         };
+        // The counters may live in memory shared between processes.
+        static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
         struct QueueView {
             QueueHeader* header{nullptr};
@@ -98,18 +102,41 @@ namespace MultiQueues {
 
             blocks_ = (detail::QueueHeaderSize + capacity) / detail::cache_line;
             region_ = reinterpret_cast<std::byte*>(alloc_.allocate(blocks_));
+            init(capacity);
+        }
 
-            // TODO: allow for IPC via ring buffer
-            auto* header = ::new (region_) detail::QueueHeader{
-                .protocol_major = detail::ProtocolMajor,
-                .protocol_minor = detail::ProtocolMinor,
-                .capacity = capacity,
-            };
+        enum class Open { Create, Attach };
+
+        // Bytes a queue of `capacity` occupies in caller-provided memory.
+        static constexpr std::size_t region_size(const std::size_t capacity) {
+            return detail::QueueHeaderSize + capacity;
+        }
+
+        // A queue in caller-owned memory of region_size(capacity) bytes, cache-line aligned: e.g. a
+        // shared-memory mapping, so producers and consumers can live in different processes. Create
+        // initialises a new queue there; Attach joins one already initialised (by any process),
+        // throwing if it isn't a queue of this protocol and capacity. The memory is not freed.
+        AbstractQueue(std::byte* region, const std::size_t capacity, const Open open) : region_{region} {
+            assert((capacity & (capacity - 1)) == 0);
+            assert(capacity >= detail::cache_line);
+            assert(reinterpret_cast<std::uintptr_t>(region) % detail::cache_line == 0);
+
+            if (open == Open::Create) {
+                init(capacity);
+                return;
+            }
+            auto* header = reinterpret_cast<detail::QueueHeader*>(region_);
+            if (header->protocol_major != detail::ProtocolMajor || header->capacity != capacity)
+                throw std::runtime_error("MultiQueues: region does not hold a queue of this protocol/capacity");
             view_ = detail::QueueView{header, region_ + detail::QueueHeaderSize, capacity};
         }
-        ~AbstractQueue() { alloc_.deallocate(reinterpret_cast<detail::Line*>(region_), blocks_); };
+
+        ~AbstractQueue() {
+            if (blocks_) alloc_.deallocate(reinterpret_cast<detail::Line*>(region_), blocks_);
+        }
 
         Policy::producer_type get_producer() { return typename Policy::producer_type{view_}; };
+        // Reads only frames published after this call.
         Policy::consumer_type get_consumer() {
             return typename Policy::consumer_type{view_};
         }
@@ -119,8 +146,17 @@ namespace MultiQueues {
         AbstractQueue(const AbstractQueue&) = delete;
         AbstractQueue& operator=(const AbstractQueue&) = delete;
     private:
+        void init(const std::size_t capacity) {
+            auto* header = ::new (region_) detail::QueueHeader{
+                .protocol_major = detail::ProtocolMajor,
+                .protocol_minor = detail::ProtocolMinor,
+                .capacity = capacity,
+            };
+            view_ = detail::QueueView{header, region_ + detail::QueueHeaderSize, capacity};
+        }
+
         [[no_unique_address]] Allocator alloc_;
-        size_t blocks_;
+        size_t blocks_ = 0; // 0: caller-owned memory, not ours to free
 
         std::byte* region_;
         detail::QueueView view_;
