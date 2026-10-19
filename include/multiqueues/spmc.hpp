@@ -9,7 +9,17 @@
 #include "abstract_queue.hpp"
 
 namespace MultiQueues {
+    namespace detail {
+        struct QueueHeader {
+            uint64_t protocol_major;
+            uint64_t protocol_minor;
+            uint64_t capacity;
+            alignas(cache_line) std::atomic<uint64_t> read_counter{0};
+            alignas(cache_line) std::atomic<uint64_t> write_counter{0};
+        };
+    };
     using namespace detail;
+
 
     class SPMCProducer {
     public:
@@ -110,5 +120,6 @@ namespace MultiQueues {
     };
     static_assert(Producer<SPMCProducer> && Consumer<SPMCConsumer>);
 
-    template <class Allocator = std::allocator<detail::Line>> using SPMC = AbstractQueue<SPMCPolicy, Allocator>;
+    template <class Allocator = std::allocator<detail::Line>>
+    using SPMC = AbstractQueue<SPMCPolicy, Allocator>;
 }

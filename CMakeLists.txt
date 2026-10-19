@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
 
-add_library(multiqueues INTERFACE)
+add_library(multiqueues INTERFACE
+        include/multiqueues/mpmc.hpp)
 target_include_directories(multiqueues INTERFACE include)
 target_link_libraries(multiqueues INTERFACE Threads::Threads)
 

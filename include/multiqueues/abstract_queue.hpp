@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <concepts>
 #include <cstddef>
@@ -9,7 +10,7 @@
 #include <new>
 #include <span>
 #include <stdexcept>
-#include <cassert>
+#include <type_traits>
 
 namespace MultiQueues {
     namespace detail {
@@ -30,18 +31,24 @@ namespace MultiQueues {
             return (n + (A - 1)) & ~(A - 1);
         }
 
-        struct QueueHeader {
+        struct HeaderPrefix {
             uint64_t protocol_major;
             uint64_t protocol_minor;
             uint64_t capacity;
-            alignas(cache_line) std::atomic<uint64_t> read_counter{0};
-            alignas(cache_line) std::atomic<uint64_t> write_counter{0};
         };
-        // The counters may live in memory shared between processes.
-        static_assert(std::atomic<uint64_t>::is_always_lock_free);
 
+        template <class H>
+        concept QueueHeader =
+            std::is_standard_layout_v<H> &&
+            alignof(H) <= cache_line &&
+            requires(H& h) { { h.prefix } -> std::same_as<HeaderPrefix&>; };
+
+        template <class H>
+        inline constexpr uint64_t QueueHeaderSize = align_as<cache_line>(sizeof(H));
+
+        template <typename Header>
         struct QueueView {
-            QueueHeader* header{nullptr};
+            Header* header{nullptr};
             std::byte* data{nullptr};
             uint64_t capacity{0}; // bytes in the data region; always a power of two
 
@@ -58,29 +65,28 @@ namespace MultiQueues {
 
         // Written where a frame would not fit before the end of the buffer: "continue reading at offset 0".
         inline constexpr MessageHeader SpanHeader{0, std::numeric_limits<uint32_t>::max()};
-        inline constexpr uint64_t QueueHeaderSize = align_as<cache_line>(sizeof(QueueHeader));
 
         // Payloads start on their own cache line, so any type up to alignas(cache_line) can be placed in them.
         inline constexpr uint64_t PayloadOffset = align_as<cache_line>(sizeof(MessageHeader));
 
-        inline uint64_t frame_size(std::size_t size) { return align_as<cache_line>(PayloadOffset + size); }
+        inline uint64_t frame_size(std::size_t size) {
+            return align_as<cache_line>(PayloadOffset + size);
+        }
 
+        // Concept functor helpers
         struct WriteFnArchetype {
             void* state;
             void operator()(std::span<std::byte>) const {}
         };
-
         struct ReadFnArchetype {
             void* state;
             void operator()(MessageHeader, std::span<std::byte>) const {}
         };
+
+        enum class ReadStatus : uint8_t { Empty, Ok, Lapped };
     };
 
-    enum class ReadStatus : uint8_t {
-        Empty,
-        Ok,
-        Lapped,
-    };
+    // Abstract class definitions
 
     template <class P>
     concept Producer = requires(P p, std::size_t size, uint32_t type, detail::WriteFnArchetype fn) {
@@ -88,19 +94,31 @@ namespace MultiQueues {
     };
     template <class C>
     concept Consumer = requires(C c, detail::ReadFnArchetype buf) {
-        { c.read(buf) } -> std::same_as<ReadStatus>;
+        { c.read(buf) } -> std::same_as<detail::ReadStatus>;
     };
 
-    template <class Policy, class Allocator = std::allocator<detail::Line>> class AbstractQueue {
+    template <class P>
+    concept QueuePolicy = requires {
+        typename P::header_type;
+        typename P::producer_type;
+        typename P::consumer_type;
+        { P::policy_id } -> std::convertible_to<uint64_t>;
+    } && detail::QueueHeader<typename P::header_type>;
+
+    template <QueuePolicy Policy, class Allocator = std::allocator<detail::Line>>
+    class AbstractQueue {
     public:
-        using allocator_type = Allocator;
-        using value_type = std::byte;
+        using header_type   = typename Policy::header_type;
+        using view_type     = detail::QueueView<header_type>;
+        using producer_type = typename Policy::producer_type;
+        using consumer_type = typename Policy::consumer_type;
+        static constexpr uint64_t header_size = detail::QueueHeaderSize<header_type>;
 
         explicit AbstractQueue(const std::size_t capacity, Allocator alloc = Allocator{}) : alloc_{alloc} {
             assert((capacity & (capacity - 1)) == 0); // capacity power of 2
             assert(capacity >= detail::cache_line); // capacity >= cache line size
 
-            blocks_ = (detail::QueueHeaderSize + capacity) / detail::cache_line;
+            blocks_ = (header_size + capacity) / detail::cache_line;
             region_ = reinterpret_cast<std::byte*>(alloc_.allocate(blocks_));
             init(capacity);
         }
@@ -109,7 +127,7 @@ namespace MultiQueues {
 
         // Bytes a queue of `capacity` occupies in caller-provided memory.
         static constexpr std::size_t region_size(const std::size_t capacity) {
-            return detail::QueueHeaderSize + capacity;
+            return header_size + capacity;
         }
 
         // A queue in caller-owned memory of region_size(capacity) bytes, cache-line aligned: e.g. a
@@ -125,10 +143,10 @@ namespace MultiQueues {
                 init(capacity);
                 return;
             }
-            auto* header = reinterpret_cast<detail::QueueHeader*>(region_);
+            auto* header = reinterpret_cast<detail::HeaderPrefix*>(region_);
             if (header->protocol_major != detail::ProtocolMajor || header->capacity != capacity)
                 throw std::runtime_error("MultiQueues: region does not hold a queue of this protocol/capacity");
-            view_ = detail::QueueView{header, region_ + detail::QueueHeaderSize, capacity};
+            view_ = detail::QueueView{header, region_ + header_size, capacity};
         }
 
         ~AbstractQueue() {
@@ -147,18 +165,18 @@ namespace MultiQueues {
         AbstractQueue& operator=(const AbstractQueue&) = delete;
     private:
         void init(const std::size_t capacity) {
-            auto* header = ::new (region_) detail::QueueHeader{
+            auto* header = ::new (region_) detail::HeaderPrefix{
                 .protocol_major = detail::ProtocolMajor,
                 .protocol_minor = detail::ProtocolMinor,
                 .capacity = capacity,
             };
-            view_ = detail::QueueView{header, region_ + detail::QueueHeaderSize, capacity};
+            view_ = view_type{header, region_ + header_size, capacity};
         }
 
         [[no_unique_address]] Allocator alloc_;
         size_t blocks_ = 0; // 0: caller-owned memory, not ours to free
 
         std::byte* region_;
-        detail::QueueView view_;
+        view_type view_;
     };
 }

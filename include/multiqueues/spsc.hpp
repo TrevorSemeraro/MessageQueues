@@ -15,6 +15,14 @@ namespace MultiQueues {
             uint64_t pos;
             bool wrap;
         };
+
+        struct QueueHeader {
+            uint64_t protocol_major;
+            uint64_t protocol_minor;
+            uint64_t capacity;
+            alignas(cache_line) std::atomic<uint64_t> read_counter{0};
+            alignas(cache_line) std::atomic<uint64_t> write_counter{0};
+        };
     }
     using namespace detail;
 
