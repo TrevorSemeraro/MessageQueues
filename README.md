@@ -8,8 +8,8 @@
 include(FetchContent)
 FetchContent_Declare(multiqueues
     GIT_REPOSITORY https://github.com/TrevorSemeraro/MessageQueues.git
-    GIT_TAG master)
-FetchContent_MakeAvailable(queues)
+    GIT_TAG master)  # or pin a commit hash
+FetchContent_MakeAvailable(multiqueues)
 
 target_link_libraries(my_app PRIVATE multiqueues)
 ```
@@ -51,6 +51,26 @@ Backings: `Heap{}` (one process), `SharedMemory{name}` (between processes) and
 Queues: `SPSC`, `SPMC` (consumers can be lapped) and `MPSC`. Creating a second producer
 or consumer where only one is allowed throws `std::logic_error`, unless the process
 holding that role has died, in which case the role is reclaimed.
+
+## SPMC reads
+
+The SPMC producer never waits for consumers, so a slow consumer can be lapped while it
+is reading. The callback may then see a frame that is being overwritten. Treat what the
+callback read as valid only once `read()` returns `Ok`; on `Lapped`, discard it and call
+`respawn()` to skip to the newest frame:
+
+```cpp
+Order o;
+switch (consumer.read([&](MessageHeader, std::span<std::byte> buf) {
+    std::memcpy(&o, buf.data(), sizeof(o));  // copy out; don't act on it yet
+})) {
+case ReadStatus::Ok:     handle(o); break;
+case ReadStatus::Lapped: consumer.respawn(); break;
+case ReadStatus::Empty:  break;
+}
+```
+
+SPSC and MPSC never overwrite unread data, so their callbacks always see complete frames.
 
 # Performance:
 

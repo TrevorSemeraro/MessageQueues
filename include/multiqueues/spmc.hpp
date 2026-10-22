@@ -38,8 +38,7 @@ public:
 
 		if (offset_ + len >= queue_.capacity) {
 			published_ += queue_.capacity - offset_;
-			queue_.header->reserved.store(published_,
-										  std::memory_order_release);
+			reserve(published_);
 			::new (queue_.data + offset_) MessageHeader{detail::SPAN_HEADER};
 			offset_ = 0;
 		}
@@ -48,7 +47,7 @@ public:
 		if (reserved_ < published_) {
 			/* TODO: reserve a block of bytes at a time */
 			reserved_ = detail::align_as<CACHE_LINE>(published_);
-			queue_.header->reserved.store(reserved_, std::memory_order_release);
+			reserve(reserved_);
 		}
 
 		::new (queue_.data + offset_) MessageHeader{size, type};
@@ -70,6 +69,16 @@ private:
 		  offset_{queue.offset_of(published_)}, reserved_{published_},
 		  claim_{std::move(claim)}
 	{
+	}
+
+	/*
+	 * Announces that everything before `end` may be overwritten. The fence
+	 * keeps the overwrites that follow from becoming visible before it.
+	 */
+	void reserve(const uint64_t end)
+	{
+		queue_.header->reserved.store(end, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
 	}
 
 	view_type queue_;
@@ -94,29 +103,28 @@ public:
 
 		MessageHeader header;
 		std::memcpy(&header, queue_.data + offset_, sizeof(header));
-
-		uint64_t reserved =
-			queue_.header->reserved.load(std::memory_order_acquire);
-		if (reserved - consumed_ >= queue_.capacity)
+		if (lapped(consumed_))
 			return ReadStatus::Lapped;
 
 		if (header == detail::SPAN_HEADER) {
 			consumed_ += queue_.capacity - offset_;
 			offset_ = 0;
 			std::memcpy(&header, queue_.data, sizeof(header));
+			if (lapped(consumed_))
+				return ReadStatus::Lapped;
 		}
 
+		/*
+		 * fn may see a frame the producer is overwriting; the frame only
+		 * counts if read() then returns Ok.
+		 */
+		const uint64_t start = consumed_;
+		const uint64_t len = detail::frame_size(header.size);
 		fn(header, std::span{queue_.data + offset_ + detail::PAYLOAD_OFFSET,
 							 header.size});
-
-		const uint64_t len = detail::frame_size(header.size);
 		consumed_ += len;
 		offset_ += len;
-
-		reserved = queue_.header->reserved.load(std::memory_order_acquire);
-		if (reserved - consumed_ >= queue_.capacity)
-			return ReadStatus::Lapped;
-		return ReadStatus::Ok;
+		return lapped(start) ? ReadStatus::Lapped : ReadStatus::Ok;
 	}
 
 	/* Skips to the newest frame after being lapped. */
@@ -132,6 +140,17 @@ private:
 	using view_type = detail::QueueView<detail::SPMCHeader>;
 
 	friend struct detail::Access;
+
+	/*
+	 * Seqlock check: true if the producer may have overwritten anything
+	 * from `start` on. The fence keeps the frame reads before the load.
+	 */
+	[[nodiscard]] bool lapped(const uint64_t start) const
+	{
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return queue_.header->reserved.load(std::memory_order_relaxed) - start >
+			   queue_.capacity;
+	}
 
 	explicit SPMCConsumer(const view_type queue) : queue_{queue}
 	{
