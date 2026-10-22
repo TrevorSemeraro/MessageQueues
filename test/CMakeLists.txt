@@ -6,6 +6,8 @@ add_executable(
         Google_Tests_run
         spsc_queue_tests.cpp
         spmc_queue_tests.cpp
+        mpsc_queue_tests.cpp
+        queue_contract_tests.cpp
 )
 target_link_libraries(Google_Tests_run PRIVATE multiqueues multiqueues_warnings GTest::gtest_main)
 

@@ -18,33 +18,39 @@ target_link_libraries(my_app PRIVATE multiqueues)
 #include <multiqueues/spsc.hpp>
 
 using namespace MultiQueues;
-// capacity in bytes
-//   - power of two
-//   - GTE cache line size
-SPSC queue{1 << 20}; 
 
-SPSCProducer producer = queue.get_producer();
+// Producer process. capacity is in bytes: a power of two, at least 4 cache lines.
+// Fails if "/orders" already exists; this queue unlinks it when destroyed.
+auto queue = SPSC::create(SharedMemory{"/orders"}, 1 << 20);
+auto producer = create_producer(queue);
+
 Order parsed_result;
-# encode directly into buffer
-uint8_t result = producer.write(sizeof(Order), Order::QueueType, [&](std::span<std::byte> buf) {
-    // example: trivially copyable types
-    memcpy(buf.data(), &parsed_result, sizeof(Order));
+producer.write(sizeof(Order), Order::QueueType, [&](std::span<std::byte> buf) {
+    // encode directly into the queue
+    std::memcpy(buf.data(), &parsed_result, sizeof(Order));
 });
 
-SPSCConsumer consumer = queue.get_consumer();
-auto res = consumer.read([&](MessageHeader hdr, std::span<std::byte> buf) {
+// Consumer process. Capacity is read from the queue header.
+auto queue = SPSC::attach(SharedMemory{"/orders"});
+auto consumer = create_consumer(queue);
+
+consumer.read([&](MessageHeader hdr, std::span<std::byte> buf) {
     switch (hdr.type) {
-        case Order::QueueType: {
-            // read directly from buffer
-            Order o;
-            std::memcpy(&o, buf.data(), sizeof(Order));
-            break;
-        }
-        ...
-        default: throw std::runtime_error("Unexpected header type");
+    case Order::QueueType: {
+        Order o;
+        std::memcpy(&o, buf.data(), sizeof(Order));
+        break;
+    }
     }
 });
 ```
+
+Backings: `Heap{}` (one process), `SharedMemory{name}` (between processes) and
+`Region{ptr, size}` (memory you manage yourself).
+
+Queues: `SPSC`, `SPMC` (consumers can be lapped) and `MPSC`. Creating a second producer
+or consumer where only one is allowed throws `std::logic_error`, unless the process
+holding that role has died, in which case the role is reclaimed.
 
 # Performance:
 

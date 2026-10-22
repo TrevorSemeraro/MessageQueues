@@ -1,116 +1,146 @@
 #pragma once
 #include <atomic>
-#include <cassert>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <optional>
+#include <new>
+#include <span>
 #include <utility>
-#include <variant>
 
-#include "abstract_queue.hpp"
+#include "queue.hpp"
 
 namespace MultiQueues {
-    namespace detail {
-        struct WritePosition {
-            uint64_t pos;
-            bool wrap;
-        };
-
-        struct QueueHeader {
-            uint64_t protocol_major;
-            uint64_t protocol_minor;
-            uint64_t capacity;
-            alignas(cache_line) std::atomic<uint64_t> read_counter{0};
-            alignas(cache_line) std::atomic<uint64_t> write_counter{0};
-        };
-    }
-    using namespace detail;
-
-    class SPSCProducer {
-    public:
-        template <std::invocable<std::span<std::byte>> F> uint8_t write(std::size_t size, uint32_t type, F fn) {
-            const uint64_t w = queue_.header->write_counter.load(std::memory_order_acquire);
-            const std::size_t FrameSize = frame_size(size);
-
-            auto wp = write_position(w, FrameSize);
-            if (!wp) {
-                cached_read_counter_ = queue_.header->read_counter.load(std::memory_order_acquire);
-                wp = write_position(w, FrameSize);
-                if (!wp) return false;
-            }
-
-            if (wp->wrap) ::new (queue_.data + w) MessageHeader{SpanHeader};
-
-            std::byte* slot = queue_.data + wp->pos;
-            ::new (slot) MessageHeader{size, type};
-            fn(std::span{slot + PayloadOffset, size});
-
-            queue_.header->write_counter.store(wp->pos + FrameSize, std::memory_order_release);
-            return true;
-        }
-
-    private:
-        template <class Policy, class Allocator> friend class AbstractQueue;
-
-        explicit SPSCProducer(const QueueView queue)
-            : queue_{queue}, cached_read_counter_{queue.header->read_counter.load(std::memory_order_acquire)} {}
-
-        [[nodiscard]] std::optional<detail::WritePosition> write_position(const uint64_t w,
-                                                                          const uint64_t frame_size) const {
-            const uint64_t r = cached_read_counter_;
-            if (w >= r) {
-                if (w + frame_size + QueueHeaderSize > queue_.capacity) {
-                    if (frame_size >= r) return std::nullopt;
-                    return detail::WritePosition{0, true};
-                }
-            } else if (w + frame_size >= r) {
-                return std::nullopt;
-            }
-            return detail::WritePosition{w, false};
-        }
-
-        QueueView queue_;
-        alignas(cache_line) uint64_t cached_read_counter_;
-    };
-
-    class SPSCConsumer {
-    public:
-        template <std::invocable<MessageHeader, std::span<std::byte>> F> ReadStatus read(F&& fn) {
-            uint64_t r = queue_.header->read_counter.load(std::memory_order_acquire);
-
-            if (r == cached_write_counter_) {
-                cached_write_counter_ = queue_.header->write_counter.load(std::memory_order_acquire);
-                if (r == cached_write_counter_) return ReadStatus::Empty;
-            }
-
-            MessageHeader header{};
-            std::memcpy(&header, queue_.data + r, sizeof(header));
-            if (header == SpanHeader) {
-                r = 0;
-                std::memcpy(&header, queue_.data + r, sizeof(header));
-            }
-
-            fn(header, std::span{queue_.data + r + PayloadOffset, header.size});
-
-            queue_.header->read_counter.store(r + frame_size(header.size), std::memory_order_release);
-            return ReadStatus::Ok;
-        }
-
-    private:
-        template <class Policy, class Allocator> friend class AbstractQueue;
-
-        explicit SPSCConsumer(const QueueView queue)
-            : queue_{queue}, cached_write_counter_{queue.header->write_counter.load(std::memory_order_acquire)} {}
-
-        QueueView queue_;
-        alignas(cache_line) uint64_t cached_write_counter_;
-    };
-
-    struct SPSCPolicy {
-        using producer_type = SPSCProducer;
-        using consumer_type = SPSCConsumer;
-    };
-    static_assert(Producer<SPSCProducer> && Consumer<SPSCConsumer>);
-
-    template <class Allocator = std::allocator<detail::Line>> using SPSC = AbstractQueue<SPSCPolicy, Allocator>;
+namespace detail {
+/* Both counters are offsets into the data region. */
+struct SPSCHeader {
+	HeaderPrefix prefix;
+	alignas(CACHE_LINE) std::atomic<uint64_t> read_counter{0};
+	alignas(CACHE_LINE) std::atomic<uint64_t> write_counter{0};
 };
+}
+
+class SPSCProducer {
+public:
+	[[nodiscard]] std::size_t max_payload() const
+	{
+		return detail::max_payload(queue_.capacity);
+	}
+
+	template <std::invocable<std::span<std::byte>> F>
+	uint8_t write(const std::size_t size, const uint32_t type, F &&fn)
+	{
+		detail::check_write(size, type, queue_.capacity);
+		const uint64_t len = detail::frame_size(size);
+		uint64_t pos = write_pos_;
+
+		if (!fits(pos, len)) {
+			cached_read_ =
+				queue_.header->read_counter.load(std::memory_order_acquire);
+			if (!fits(pos, len))
+				return 0;
+		}
+
+		if (pos + len >= queue_.capacity) {
+			::new (queue_.data + pos) MessageHeader{detail::SPAN_HEADER};
+			pos = 0;
+		}
+
+		::new (queue_.data + pos) MessageHeader{size, type};
+		fn(std::span{queue_.data + pos + detail::PAYLOAD_OFFSET, size});
+
+		write_pos_ = pos + len;
+		queue_.header->write_counter.store(write_pos_,
+										   std::memory_order_release);
+		return 1;
+	}
+
+private:
+	using view_type = detail::QueueView<detail::SPSCHeader>;
+
+	friend struct detail::Access;
+
+	SPSCProducer(const view_type queue, detail::Claim claim)
+		: queue_{queue}, write_pos_{queue.header->write_counter.load(
+							 std::memory_order_relaxed)},
+		  cached_read_{
+			  queue.header->read_counter.load(std::memory_order_acquire)},
+		  claim_{std::move(claim)}
+	{
+	}
+
+	/* write_pos_ never lands on cached_read_: equal means empty. */
+	[[nodiscard]] bool fits(const uint64_t pos, const uint64_t len) const
+	{
+		if (pos < cached_read_)
+			return pos + len < cached_read_;
+		return pos + len < queue_.capacity || len < cached_read_;
+	}
+
+	view_type queue_;
+	uint64_t write_pos_;
+	uint64_t cached_read_;
+	detail::Claim claim_;
+};
+
+class SPSCConsumer {
+public:
+	template <std::invocable<MessageHeader, std::span<std::byte>> F>
+	ReadStatus read(F &&fn)
+	{
+		uint64_t pos = read_pos_;
+
+		if (pos == cached_write_) {
+			cached_write_ =
+				queue_.header->write_counter.load(std::memory_order_acquire);
+			if (pos == cached_write_)
+				return ReadStatus::Empty;
+		}
+
+		MessageHeader header;
+		std::memcpy(&header, queue_.data + pos, sizeof(header));
+		if (header == detail::SPAN_HEADER) {
+			pos = 0;
+			std::memcpy(&header, queue_.data, sizeof(header));
+		}
+
+		fn(header,
+		   std::span{queue_.data + pos + detail::PAYLOAD_OFFSET, header.size});
+
+		read_pos_ = pos + detail::frame_size(header.size);
+		queue_.header->read_counter.store(read_pos_, std::memory_order_release);
+		return ReadStatus::Ok;
+	}
+
+private:
+	using view_type = detail::QueueView<detail::SPSCHeader>;
+
+	friend struct detail::Access;
+
+	SPSCConsumer(const view_type queue, detail::Claim claim)
+		: queue_{queue},
+		  read_pos_{queue.header->read_counter.load(std::memory_order_relaxed)},
+		  cached_write_{
+			  queue.header->write_counter.load(std::memory_order_acquire)},
+		  claim_{std::move(claim)}
+	{
+	}
+
+	view_type queue_;
+	uint64_t read_pos_;
+	uint64_t cached_write_;
+	detail::Claim claim_;
+};
+
+struct SPSCPolicy {
+	using header_type = detail::SPSCHeader;
+	using producer_type = SPSCProducer;
+	using consumer_type = SPSCConsumer;
+	static constexpr uint64_t policy_id = 1;
+	static constexpr bool single_producer = true;
+	static constexpr bool single_consumer = true;
+};
+static_assert(Producer<SPSCProducer> && Consumer<SPSCConsumer>);
+
+using SPSC = Queue<SPSCPolicy>;
+}

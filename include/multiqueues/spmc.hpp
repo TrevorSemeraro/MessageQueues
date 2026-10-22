@@ -1,125 +1,158 @@
 #pragma once
 #include <atomic>
-#include <cassert>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
+#include <span>
 #include <utility>
-#include <variant>
 
-#include "abstract_queue.hpp"
+#include "queue.hpp"
 
 namespace MultiQueues {
-    namespace detail {
-        struct QueueHeader {
-            uint64_t protocol_major;
-            uint64_t protocol_minor;
-            uint64_t capacity;
-            alignas(cache_line) std::atomic<uint64_t> read_counter{0};
-            alignas(cache_line) std::atomic<uint64_t> write_counter{0};
-        };
-    };
-    using namespace detail;
+namespace detail {
+/* Both counters are running byte totals; offset_of() maps them to the ring. */
+struct SPMCHeader {
+	HeaderPrefix prefix;
+	/* end of the last complete frame */
+	alignas(CACHE_LINE) std::atomic<uint64_t> published{0};
+	/* end of the region the producer may be overwriting */
+	alignas(CACHE_LINE) std::atomic<uint64_t> reserved{0};
+};
+}
 
+/* Never blocks: slow consumers are lapped instead. */
+class SPMCProducer {
+public:
+	[[nodiscard]] std::size_t max_payload() const
+	{
+		return detail::max_payload(queue_.capacity);
+	}
 
-    class SPMCProducer {
-    public:
-        template <std::invocable<std::span<std::byte>> F> uint8_t write(std::size_t size, uint32_t type, F fn) {
-            const std::size_t FrameSize = frame_size(size);
+	template <std::invocable<std::span<std::byte>> F>
+	uint8_t write(const std::size_t size, const uint32_t type, F &&fn)
+	{
+		detail::check_write(size, type, queue_.capacity);
+		const uint64_t len = detail::frame_size(size);
 
-            if (offset_ + FrameSize + QueueHeaderSize >= queue_.capacity) {
-                published_ += queue_.capacity - queue_.offset_of(published_);
-                queue_.header->write_counter.store(published_, std::memory_order_release);
-                ::new (queue_.data + offset_) MessageHeader{SpanHeader};
-                offset_ = 0;
-            }
+		if (offset_ + len >= queue_.capacity) {
+			published_ += queue_.capacity - offset_;
+			queue_.header->reserved.store(published_,
+										  std::memory_order_release);
+			::new (queue_.data + offset_) MessageHeader{detail::SPAN_HEADER};
+			offset_ = 0;
+		}
 
-            published_ += FrameSize; // size after writing this block
-            if (reserved_ < published_) {
-                // TODO: increase counter by := Q BLOCK BYTES
-                reserved_ = align_as<cache_line>(published_);
-                queue_.header->write_counter.store(reserved_, std::memory_order_release);
-            }
+		published_ += len;
+		if (reserved_ < published_) {
+			/* TODO: reserve a block of bytes at a time */
+			reserved_ = detail::align_as<CACHE_LINE>(published_);
+			queue_.header->reserved.store(reserved_, std::memory_order_release);
+		}
 
-            ::new (queue_.data + offset_) MessageHeader{size, type};
-            fn(std::span{queue_.data + offset_ + PayloadOffset, size});
+		::new (queue_.data + offset_) MessageHeader{size, type};
+		fn(std::span{queue_.data + offset_ + detail::PAYLOAD_OFFSET, size});
 
-            offset_ += FrameSize;
-            queue_.header->read_counter.store(published_, std::memory_order_release);
-            return 1;
-        }
+		offset_ += len;
+		queue_.header->published.store(published_, std::memory_order_release);
+		return 1;
+	}
 
-    private:
-        template <class Policy, class Allocator> friend class AbstractQueue;
+private:
+	using view_type = detail::QueueView<detail::SPMCHeader>;
 
-        explicit SPMCProducer(const QueueView& queue) : queue_{queue} {
-            reserved_ = queue_.header->write_counter.load(std::memory_order_acquire);
-            published_ = reserved_;
-            offset_ = queue_.offset_of(published_);
-        }
+	friend struct detail::Access;
 
-        QueueView queue_;
-        alignas(cache_line) uint64_t published_; // total bytes made visible to consumers
-        uint64_t offset_;                        // where the next frame goes in the data region
-        uint64_t reserved_;                      // last value stored to write_counter
-    };
+	SPMCProducer(const view_type queue, detail::Claim claim)
+		: queue_{queue},
+		  published_{queue.header->published.load(std::memory_order_acquire)},
+		  offset_{queue.offset_of(published_)}, reserved_{published_},
+		  claim_{std::move(claim)}
+	{
+	}
 
-    class SPMCConsumer {
-    public:
-        template <std::invocable<MessageHeader, std::span<std::byte>> F> ReadStatus read(F&& fn) {
-            if (read_ == cached_published_) {
-                cached_published_ = queue_.header->read_counter.load(std::memory_order_acquire);
-                if (read_ == cached_published_) return ReadStatus::Empty;
-            }
+	view_type queue_;
+	alignas(CACHE_LINE) uint64_t published_;
+	uint64_t offset_;	/* where the next frame goes in the data region */
+	uint64_t reserved_; /* last value stored to header->reserved */
+	detail::Claim claim_;
+};
 
-            MessageHeader header{};
-            std::memcpy(&header, queue_.data + offset_, sizeof(header));
+/* Reads only frames published after it was created. */
+class SPMCConsumer {
+public:
+	template <std::invocable<MessageHeader, std::span<std::byte>> F>
+	ReadStatus read(F &&fn)
+	{
+		if (consumed_ == cached_published_) {
+			cached_published_ =
+				queue_.header->published.load(std::memory_order_acquire);
+			if (consumed_ == cached_published_)
+				return ReadStatus::Empty;
+		}
 
-            uint64_t writeCounter = queue_.header->write_counter.load(std::memory_order_acquire);
-            if (writeCounter - read_ >= queue_.capacity) return ReadStatus::Lapped;
+		MessageHeader header;
+		std::memcpy(&header, queue_.data + offset_, sizeof(header));
 
-            if (header == SpanHeader) {
-                offset_ = 0;
-                read_ += queue_.capacity - queue_.offset_of(read_);
-                std::memcpy(&header, queue_.data + offset_, sizeof(header));
-            }
+		uint64_t reserved =
+			queue_.header->reserved.load(std::memory_order_acquire);
+		if (reserved - consumed_ >= queue_.capacity)
+			return ReadStatus::Lapped;
 
-            fn(header, std::span{queue_.data + offset_ + PayloadOffset, header.size});
+		if (header == detail::SPAN_HEADER) {
+			consumed_ += queue_.capacity - offset_;
+			offset_ = 0;
+			std::memcpy(&header, queue_.data, sizeof(header));
+		}
 
-            read_ += frame_size(header.size);
-            offset_ += frame_size(header.size);
+		fn(header, std::span{queue_.data + offset_ + detail::PAYLOAD_OFFSET,
+							 header.size});
 
-            writeCounter = queue_.header->write_counter.load(std::memory_order_acquire);
-            if (writeCounter - read_ >= queue_.capacity) return ReadStatus::Lapped;
-            return ReadStatus::Ok;
-        }
+		const uint64_t len = detail::frame_size(header.size);
+		consumed_ += len;
+		offset_ += len;
 
-        void respawn() {
-            cached_published_ = queue_.header->read_counter.load(std::memory_order_acquire);
-            read_ = cached_published_;
-            offset_ = (read_) & (queue_.capacity - 1);
-        }
+		reserved = queue_.header->reserved.load(std::memory_order_acquire);
+		if (reserved - consumed_ >= queue_.capacity)
+			return ReadStatus::Lapped;
+		return ReadStatus::Ok;
+	}
 
-    private:
-        template <class Policy, class Allocator> friend class AbstractQueue;
+	/* Skips to the newest frame after being lapped. */
+	void respawn()
+	{
+		cached_published_ =
+			queue_.header->published.load(std::memory_order_acquire);
+		consumed_ = cached_published_;
+		offset_ = queue_.offset_of(consumed_);
+	}
 
-        explicit SPMCConsumer(const QueueView queue) : queue_{queue} {
-            cached_published_ = queue_.header->read_counter.load(std::memory_order_acquire);
-            read_ = cached_published_;
-            offset_ = queue_.offset_of(read_);
-        }
+private:
+	using view_type = detail::QueueView<detail::SPMCHeader>;
 
-        alignas(cache_line) uint64_t cached_published_;
-        QueueView queue_;
-        uint64_t offset_; // where the next frame is in the data region
-        uint64_t read_;   // total bytes consumed; compared against write_counter to detect laps
-    };
+	friend struct detail::Access;
 
-    struct SPMCPolicy {
-        using producer_type = SPMCProducer;
-        using consumer_type = SPMCConsumer;
-    };
-    static_assert(Producer<SPMCProducer> && Consumer<SPMCConsumer>);
+	explicit SPMCConsumer(const view_type queue) : queue_{queue}
+	{
+		respawn();
+	}
 
-    template <class Allocator = std::allocator<detail::Line>>
-    using SPMC = AbstractQueue<SPMCPolicy, Allocator>;
+	alignas(CACHE_LINE) uint64_t cached_published_;
+	view_type queue_;
+	uint64_t offset_;	/* where the next frame is in the data region */
+	uint64_t consumed_; /* running total; compared to reserved for laps */
+};
+
+struct SPMCPolicy {
+	using header_type = detail::SPMCHeader;
+	using producer_type = SPMCProducer;
+	using consumer_type = SPMCConsumer;
+	static constexpr uint64_t policy_id = 2;
+	static constexpr bool single_producer = true;
+	static constexpr bool single_consumer = false;
+};
+static_assert(Producer<SPMCProducer> && Consumer<SPMCConsumer>);
+
+using SPMC = Queue<SPMCPolicy>;
 }

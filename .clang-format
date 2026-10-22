@@ -1,12 +1,42 @@
+# Linux kernel coding style (Documentation/process/coding-style.rst),
+# adapted for C++.
 BasedOnStyle: LLVM
+UseTab: Always
+TabWidth: 4
 IndentWidth: 4
-ColumnLimit: 120
-NamespaceIndentation: All
+ContinuationIndentWidth: 4
+ColumnLimit: 80
 AccessModifierOffset: -4
-PointerAlignment: Left
-AllowShortFunctionsOnASingleLine: All
-AllowShortIfStatementsOnASingleLine: WithoutElse
-AllowShortLambdasOnASingleLine: All
+IndentCaseLabels: false
+NamespaceIndentation: None
+FixNamespaceComments: false
+PointerAlignment: Right
+ReferenceAlignment: Right
+SortIncludes: Never
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  BeforeLambdaBody: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: Yes
 RequiresClausePosition: OwnLine
 IndentRequiresClause: true
-FixNamespaceComments: false
+SpaceAfterCStyleCast: false
+BreakStringLiterals: false
